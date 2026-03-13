@@ -14,6 +14,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import time
 import asyncio
+import fcntl
 from webapp_server import start_webapp_server
 
 DB_INITIALIZED = False
@@ -53,6 +54,26 @@ WEBAPP_HOST = os.getenv('WEBAPP_HOST', '0.0.0.0')
 WEBAPP_PORT = int(os.getenv('WEBAPP_PORT', '8080'))
 WEBAPP_URL = os.getenv('WEBAPP_URL', f'http://localhost:{WEBAPP_PORT}/webapp')
 PARTNER_LINK = "https://reg.eda.yandex.ru/?advertisement_campaign=forms_for_agents&user_invite_code=f570ca2872604481884bbe72291d8ec5&utm_content=blank"
+INSTANCE_LOCK_FILE = os.getenv('INSTANCE_LOCK_FILE', 'bot_instance.lock')
+INSTANCE_LOCK_HANDLE = None
+
+
+
+def acquire_instance_lock():
+    """Гарантирует, что запущен только один polling-инстанс бота."""
+    global INSTANCE_LOCK_HANDLE
+    lock_path = os.path.abspath(INSTANCE_LOCK_FILE)
+    INSTANCE_LOCK_HANDLE = open(lock_path, 'w')
+
+    try:
+        fcntl.flock(INSTANCE_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.error(f"❌ Бот уже запущен (lock: {lock_path}). Остановите второй процесс, иначе будет 409 Conflict.")
+        return False
+
+    INSTANCE_LOCK_HANDLE.write(str(os.getpid()))
+    INSTANCE_LOCK_HANDLE.flush()
+    return True
 
 def get_db():
     """Возвращает соединение с БД"""
@@ -3754,6 +3775,9 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ЗАПУСК ==========
 def main():
+    if not acquire_instance_lock():
+        return
+
     # Инициализируем БД
     init_database()
     
@@ -3801,7 +3825,7 @@ def main():
     logger.info("🚀 Запускаем бот в режиме polling (ручное обновление)")
     
     # Запускаем polling
-    application.run_polling()
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
