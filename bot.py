@@ -30,7 +30,7 @@ index fa67859ca6d1d14f668ed0bb2ae14a6a00048ed1..80c3d4563fdd2fd36b548ef38570e7f1
 -logger = logging.getLogger(__name__)
 -
 -# Токен бота
--TOKEN = '8685226609:AAEA8vHoWELRP7_KwXfV9Qbpq1usLUfdJ6o'
+-TOKEN = '8243363756:AAHAs0qO2CEnwebZJoy6O99AfT8pBfjQYuQ'
 -
 -# ID администратора
 -ADMIN_ID = 860845946
