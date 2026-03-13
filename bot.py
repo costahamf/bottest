@@ -2,7 +2,7 @@ import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import traceback
 import random
@@ -14,6 +14,10 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import time
 import asyncio
+import hashlib
+import hmac
+from urllib.parse import parse_qsl
+from flask import Flask, request, jsonify, send_file
 
 DB_INITIALIZED = False
 
@@ -48,6 +52,10 @@ IMAGES = {
 # ========== ПОСТОЯННОЕ ХРАНЕНИЕ ДАННЫХ ==========
 DB_PATH = 'bot_database.db'
 BACKUP_FILE = 'backup.json'
+WEBAPP_HOST = os.getenv('WEBAPP_HOST', '0.0.0.0')
+WEBAPP_PORT = int(os.getenv('WEBAPP_PORT', '8080'))
+WEBAPP_URL = os.getenv('WEBAPP_URL', f'http://localhost:{WEBAPP_PORT}/webapp')
+PARTNER_LINK = "https://reg.eda.yandex.ru/?advertisement_campaign=forms_for_agents&user_invite_code=f570ca2872604481884bbe72291d8ec5&utm_content=blank"
 
 def get_db():
     """Возвращает соединение с БД"""
@@ -125,6 +133,30 @@ def init_database():
                       reject_reason TEXT,
                       invited_at TEXT,
                       FOREIGN KEY (recruiter_id) REFERENCES users(user_id))''')
+
+        # Профили для WebApp
+        c.execute('''CREATE TABLE IF NOT EXISTS webapp_users
+                     (telegram_id INTEGER PRIMARY KEY,
+                      username TEXT,
+                      first_name TEXT,
+                      avatar TEXT,
+                      updated_at TEXT)''')
+
+        # Лиды курьеров в mini CRM
+        c.execute('''CREATE TABLE IF NOT EXISTS webapp_leads
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      owner_telegram_id INTEGER NOT NULL,
+                      fio TEXT NOT NULL,
+                      city TEXT NOT NULL,
+                      status TEXT DEFAULT 'pending',
+                      orders INTEGER DEFAULT 0,
+                      reward REAL DEFAULT 0,
+                      created_at TEXT,
+                      FOREIGN KEY (owner_telegram_id) REFERENCES webapp_users(telegram_id))''')
+
+        # Индексы для ускорения выборок WebApp
+        c.execute("CREATE INDEX IF NOT EXISTS idx_webapp_leads_owner ON webapp_leads(owner_telegram_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_webapp_leads_status ON webapp_leads(status)")
         
         conn.commit()
         
@@ -1589,6 +1621,190 @@ async def send_menu_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, me
     
     return None
 
+
+
+def _parse_webapp_user(init_data: str):
+    """Валидирует Telegram WebApp initData и возвращает профиль пользователя."""
+    if not init_data:
+        raise ValueError("initData is required")
+
+    data = dict(parse_qsl(init_data, keep_blank_values=True))
+    hash_value = data.pop('hash', None)
+    if not hash_value:
+        raise ValueError('Invalid initData: hash is missing')
+
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+    calculated_hash = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(calculated_hash, hash_value):
+        raise ValueError('Invalid initData signature')
+
+    user = json.loads(data.get('user', '{}'))
+    if not user or 'id' not in user:
+        raise ValueError('User payload not found')
+
+    return {
+        'telegram_id': int(user['id']),
+        'username': user.get('username', ''),
+        'first_name': user.get('first_name', 'Пользователь'),
+        'avatar': user.get('photo_url', '')
+    }
+
+
+def _require_webapp_user(init_data: str):
+    """Единая точка валидации initData + upsert профиля."""
+    user = _parse_webapp_user(init_data)
+    upsert_webapp_user(user)
+    return user
+
+
+def _normalize_courier_input(raw_text: str):
+    """Парсит строку вида 'Фамилия Имя Город' или 'Фамилия Имя, Город'."""
+    raw = (raw_text or '').strip()
+    if ',' in raw:
+        left, right = [part.strip() for part in raw.split(',', 1)]
+        fio_parts = left.split()
+        city = right
+    else:
+        parts = raw.split()
+        fio_parts = parts[:2]
+        city = " ".join(parts[2:])
+
+    if len(fio_parts) < 2 or not city:
+        raise ValueError('Используйте формат: Фамилия Имя Город')
+
+    fio = " ".join(fio_parts[:2])
+    return fio, city
+
+
+def upsert_webapp_user(user_data):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''INSERT INTO webapp_users(telegram_id, username, first_name, avatar, updated_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(telegram_id) DO UPDATE SET
+                 username=excluded.username,
+                 first_name=excluded.first_name,
+                 avatar=excluded.avatar,
+                 updated_at=excluded.updated_at''',
+              (user_data['telegram_id'], user_data['username'], user_data['first_name'], user_data['avatar'], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+
+
+def get_webapp_stats(owner_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''SELECT COUNT(*),
+                        SUM(CASE WHEN status='accepted' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),
+                        SUM(reward)
+                 FROM webapp_leads
+                 WHERE owner_telegram_id = ?''', (owner_id,))
+    total, accepted, pending, reward = c.fetchone()
+    return {'total': total or 0, 'accepted': accepted or 0, 'pending': pending or 0, 'reward': float(reward or 0)}
+
+
+def _fetch_leads_for_user(user_id: int, include_all: bool = False):
+    conn = get_db()
+    c = conn.cursor()
+    base_query = '''SELECT l.id, l.owner_telegram_id, l.fio, l.city, l.status, l.orders, l.reward, l.created_at, u.avatar
+                    FROM webapp_leads l
+                    LEFT JOIN webapp_users u ON l.owner_telegram_id = u.telegram_id'''
+    if include_all:
+        c.execute(base_query + ' ORDER BY l.id DESC')
+    else:
+        c.execute(base_query + ' WHERE l.owner_telegram_id = ? ORDER BY l.id DESC', (user_id,))
+
+    return [
+        {
+            'id': row[0],
+            'owner_telegram_id': row[1],
+            'fio': row[2],
+            'city': row[3],
+            'status': row[4],
+            'orders': row[5],
+            'reward': row[6],
+            'created_at': row[7],
+            'owner_avatar': row[8]
+        }
+        for row in c.fetchall()
+    ]
+
+
+def build_webapp():
+    app = Flask(__name__)
+
+    @app.errorhandler(ValueError)
+    def handle_value_error(err):
+        return jsonify({'error': str(err)}), 400
+
+    @app.get('/webapp')
+    def webapp_page():
+        return send_file('webapp.html')
+
+    @app.post('/api/me')
+    def api_me():
+        payload = request.get_json(silent=True) or {}
+        user = _require_webapp_user(payload.get('initData', ''))
+        return jsonify({
+            **user,
+            'is_admin': is_admin(user['telegram_id']),
+            'stats': get_webapp_stats(user['telegram_id'])
+        })
+
+    @app.get('/api/leads')
+    def api_leads():
+        user = _require_webapp_user(request.args.get('initData', ''))
+        leads = _fetch_leads_for_user(
+            user_id=user['telegram_id'],
+            include_all=is_admin(user['telegram_id'])
+        )
+        return jsonify({'leads': leads})
+
+    @app.post('/api/leads')
+    def api_create_lead():
+        payload = request.get_json(silent=True) or {}
+        user = _require_webapp_user(payload.get('initData', ''))
+        fio, city = _normalize_courier_input(payload.get('text', ''))
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''INSERT INTO webapp_leads(owner_telegram_id, fio, city, status, orders, reward, created_at)
+                     VALUES (?, ?, ?, 'pending', 0, 0, ?)''',
+                  (user['telegram_id'], fio, city, datetime.now().strftime('%d.%m.%Y %H:%M')))
+        conn.commit()
+        return jsonify({'ok': True})
+
+    @app.patch('/api/leads/<int:lead_id>/status')
+    def api_change_status(lead_id):
+        payload = request.get_json(silent=True) or {}
+        user = _require_webapp_user(payload.get('initData', ''))
+        if not is_admin(user['telegram_id']):
+            return jsonify({'error': 'forbidden'}), 403
+
+        status = payload.get('status', 'pending')
+        if status not in ('pending', 'accepted', 'rejected'):
+            return jsonify({'error': 'bad status'}), 400
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('UPDATE webapp_leads SET status = ? WHERE id = ?', (status, lead_id))
+        conn.commit()
+        return jsonify({'ok': True})
+
+    return app
+
+
+def start_webapp_server():
+    app = build_webapp()
+    thread = threading.Thread(
+        target=lambda: app.run(host=WEBAPP_HOST, port=WEBAPP_PORT, debug=False, use_reloader=False),
+        daemon=True
+    )
+    thread.start()
+    logger.info(f"🌐 WebApp запущен: {WEBAPP_URL}")
+
 # ========== ОСНОВНЫЕ ФУНКЦИИ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1634,6 +1850,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📝 Пройти тест", callback_data='take_test')],
             [InlineKeyboardButton("💰 Вывод средств", callback_data='withdrawal')],
             [InlineKeyboardButton("👤 Личный кабинет", callback_data='personal_account')],
+            [InlineKeyboardButton("📱 Mini CRM", web_app=WebAppInfo(url=WEBAPP_URL))],
             [InlineKeyboardButton("💼 Ставки по городам", callback_data='rates')],
             [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data='support')]
         ]
@@ -2408,6 +2625,7 @@ async def personal_account_menu(query, user_id, context):
         [InlineKeyboardButton("👥 Список моих курьеров", callback_data='my_couriers')],
         [InlineKeyboardButton("📝 Записать курьера", callback_data='add_courier')],
         [InlineKeyboardButton("👀 Посмотреть лидов", url='https://partners-app.yandex.ru/team_ref/92cc13ee5ebf4e39beaf9e63107415a7?locale=ru')],
+        [InlineKeyboardButton("📱 Открыть mini CRM", web_app=WebAppInfo(url=WEBAPP_URL))],
         [InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')]
     ]
     
@@ -2798,6 +3016,7 @@ async def finish_test(query, context):
             [InlineKeyboardButton("📝 Пройти тест", callback_data='take_test')],
             [InlineKeyboardButton("💰 Вывод средств", callback_data='withdrawal')],
             [InlineKeyboardButton("👤 Личный кабинет", callback_data='personal_account')],
+            [InlineKeyboardButton("📱 Mini CRM", web_app=WebAppInfo(url=WEBAPP_URL))],
             [InlineKeyboardButton("💼 Ставки по городам", callback_data='rates')],
             [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data='support')]
         ]
@@ -3062,6 +3281,7 @@ async def back_to_main(query, user_id, context):
             [InlineKeyboardButton("📝 Пройти тест", callback_data='take_test')],
             [InlineKeyboardButton("💰 Вывод средств", callback_data='withdrawal')],
             [InlineKeyboardButton("👤 Личный кабинет", callback_data='personal_account')],
+            [InlineKeyboardButton("📱 Mini CRM", web_app=WebAppInfo(url=WEBAPP_URL))],
             [InlineKeyboardButton("💼 Ставки по городам", callback_data='rates')],
             [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data='support')]
         ]
@@ -3735,6 +3955,7 @@ def main():
     # Запускаем автосохранение и мониторинг
     start_auto_backup()
     start_sheet_monitoring()
+    start_webapp_server()
     
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()

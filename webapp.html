@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Courier CRM</title>
+  <style>
+    :root{--yellow:#ffd84d;--black:#111;--white:#fff;--muted:#666;--bg:#f7f7f7}
+    *{box-sizing:border-box} body{font-family:Inter,system-ui,sans-serif;margin:0;background:var(--bg);color:var(--black)}
+    .wrap{padding:14px;max-width:900px;margin:0 auto}
+    .card{background:#fff;border-radius:14px;padding:14px;box-shadow:0 4px 18px rgba(0,0,0,.08);margin-bottom:12px}
+    .profile{display:flex;align-items:center;gap:10px}.avatar{width:44px;height:44px;border-radius:50%;background:#ddd;object-fit:cover}
+    h1{font-size:18px;margin:0}.muted{color:var(--muted);font-size:13px}
+    .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.stat{background:#fff7d1;border-radius:12px;padding:10px}
+    .stat b{font-size:20px;display:block}
+    .row{display:flex;gap:8px}.row input{flex:1;padding:12px;border-radius:10px;border:1px solid #ddd}
+    button{border:none;background:var(--yellow);color:#000;padding:12px 14px;border-radius:10px;font-weight:700}
+    table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+    th{font-size:12px;color:#666}
+    .status{font-weight:700}
+    .empty{padding:16px;text-align:center;color:#666}
+    .partner{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .partner input{flex:1;min-width:220px;padding:9px;border:1px solid #ddd;border-radius:8px}
+    .admin-controls select{padding:6px;border-radius:8px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card profile">
+    <img id="avatar" class="avatar"/>
+    <div><h1 id="name">Загрузка...</h1><div class="muted" id="username"></div></div>
+  </div>
+
+  <div class="card">
+    <div class="stats">
+      <div class="stat"><span>Всего курьеров</span><b id="s-total">0</b></div>
+      <div class="stat"><span>Активных</span><b id="s-active">0</b></div>
+      <div class="stat"><span>На проверке</span><b id="s-pending">0</b></div>
+      <div class="stat"><span>Заработано</span><b id="s-reward">0 ₽</b></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="fioCity" placeholder="Иванов Иван Москва"/>
+      <button id="addBtn">➕ Добавить</button>
+    </div>
+  </div>
+
+  <div class="card partner">
+    <input id="partnerLink" readonly value="https://reg.eda.yandex.ru/?advertisement_campaign=forms_for_agents&user_invite_code=f570ca2872604481884bbe72291d8ec5&utm_content=blank"/>
+    <button id="copyBtn">📋 Скопировать ссылку</button>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>Аватар</th><th>ФИО</th><th>Город</th><th>Статус</th><th>Дата</th><th>Заказы</th><th>Вознаграждение</th><th id="adminHead" style="display:none">Admin</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div id="empty" class="empty" style="display:none">Вы еще не добавили курьеров</div>
+  </div>
+</div>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+const tg = window.Telegram.WebApp; tg.expand();
+const initData = tg.initData;
+let isAdmin = false;
+
+async function api(path, opts={}) {
+  const res = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+function statusLabel(s){return s==='accepted'?'🟢 Принят':s==='rejected'?'🔴 Отклонен':'🟡 Ожидает'}
+
+async function load(){
+  const me = await api('/api/me',{method:'POST',body:JSON.stringify({initData})});
+  isAdmin = me.is_admin;
+  document.getElementById('adminHead').style.display = isAdmin?'':'none';
+  document.getElementById('name').textContent = me.first_name || 'Пользователь';
+  document.getElementById('username').textContent = me.username ? '@'+me.username : 'Без username';
+  document.getElementById('avatar').src = me.avatar || 'https://placehold.co/100x100';
+  drawStats(me.stats);
+  await loadLeads();
+}
+function drawStats(s){
+  document.getElementById('s-total').textContent = s.total;
+  document.getElementById('s-active').textContent = s.accepted;
+  document.getElementById('s-pending').textContent = s.pending;
+  document.getElementById('s-reward').textContent = `${s.reward} ₽`;
+}
+async function loadLeads(){
+  const data = await api('/api/leads?initData='+encodeURIComponent(initData));
+  const tbody = document.getElementById('tbody'); tbody.innerHTML='';
+  document.getElementById('empty').style.display = data.leads.length ? 'none' : '';
+  data.leads.forEach(l=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><img class="avatar" src="${l.owner_avatar || 'https://placehold.co/100x100'}"></td>
+      <td>${l.fio}</td><td>${l.city}</td>
+      <td class="status">${statusLabel(l.status)}</td>
+      <td>${l.created_at}</td><td>${l.orders}</td><td>${l.reward} ₽</td>
+      ${isAdmin ? `<td class="admin-controls"><select data-id="${l.id}"><option value="pending">Ожидает</option><option value="accepted">Принять</option><option value="rejected">Отклонить</option></select></td>`:''}
+    `;
+    if (isAdmin) tr.querySelector('select').value = l.status;
+    tbody.appendChild(tr);
+  });
+  if (isAdmin){
+    document.querySelectorAll('select[data-id]').forEach(s=>s.onchange=async()=>{
+      await api(`/api/leads/${s.dataset.id}/status`,{method:'PATCH',body:JSON.stringify({initData,status:s.value})});
+      await load();
+    })
+  }
+}
+
+document.getElementById('addBtn').onclick = async ()=>{
+  const value = document.getElementById('fioCity').value.trim();
+  if (!value) return;
+  await api('/api/leads',{method:'POST',body:JSON.stringify({initData,text:value})});
+  document.getElementById('fioCity').value='';
+  await load();
+}
+document.getElementById('copyBtn').onclick = async ()=>{
+  const link = document.getElementById('partnerLink').value;
+  await navigator.clipboard.writeText(link);
+  tg.showPopup({title:'Готово',message:'Ссылка скопирована',buttons:[{type:'ok'}]});
+}
+load().catch(e=>tg.showAlert('Ошибка загрузки: '+e.message));
+</script>
+</body></html>
